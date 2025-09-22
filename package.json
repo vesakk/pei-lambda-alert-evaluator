@@ -1,0 +1,23 @@
+{
+  "name": "pei-lambda-alert-evaluator",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "directories": {
+    "test": "test"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/vesakk/pei-lambda-alert-evaluator.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/vesakk/pei-lambda-alert-evaluator/issues"
+  },
+  "homepage": "https://github.com/vesakk/pei-lambda-alert-evaluator#readme"
+}
