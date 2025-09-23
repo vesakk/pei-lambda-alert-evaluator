@@ -10,7 +10,7 @@ concurrency:
   cancel-in-progress: true
 env:
   AWS_REGION: ${{ vars.AWS_REGION }}
-  LAMBDA_NAME: ${{ vars.LAMBDA_NAME }}                     # esim. pei-lambda-alert-evaluator
+  LAMBDA_NAME: ${{ vars.ALERTS_LAMBDA_NAME }}                     # esim. pei-lambda-alert-evaluator
   LAMBDA_HANDLER: ${{ vars.LAMBDA_HANDLER }}               # esim. src/lambda_alert_evaluator.handler
   LAMBDA_RUNTIME: ${{ vars.LAMBDA_RUNTIME }}               # esim. nodejs20.x
   SUBS_TABLE: ${{ vars.SUBS_TABLE }}                       # esim. alert_subscriptions
@@ -59,7 +59,7 @@ jobs:
 
       - name: Zip package
         run: |
-          zip -r pei-lambda-alert-evaluator.zip src package.json package-lock.json node_modules
+          zip -r pei-lambda-alert-evaluator.zip index.mjs src package.json package-lock.json node_modules
 
       - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
