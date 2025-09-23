@@ -1,0 +1,111 @@
+name: Deploy pei-lambda-alert-evaluator to Lambda
+on:
+  push:
+    branches: [ "main" ]
+permissions:
+  id-token: write
+  contents: read
+concurrency:
+  group: lambda-deploy-main
+  cancel-in-progress: true
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  LAMBDA_NAME: ${{ vars.LAMBDA_NAME }}                     # esim. pei-lambda-alert-evaluator
+  LAMBDA_HANDLER: ${{ vars.LAMBDA_HANDLER }}               # esim. src/lambda_alert_evaluator.handler
+  LAMBDA_RUNTIME: ${{ vars.LAMBDA_RUNTIME }}               # esim. nodejs20.x
+  SUBS_TABLE: ${{ vars.SUBS_TABLE }}                       # esim. alert_subscriptions
+  STATE_TABLE: ${{ vars.STATE_TABLE }}                     # esim. alert_state
+  SES_FROM: ${{ vars.SES_FROM }}                           # esim. noreply@yourdomain.tld (SES verified)
+  BUCKET_NAME: ${{ vars.BUCKET_NAME }}
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Use Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Install deps (clean)
+        run: npm ci
+
+      - name: Run tests
+        run: npm test
+
+  deploy:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Use Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Install deps (clean)
+        run: npm ci
+
+      - name: Prune dev dependencies
+        run: npm prune --omit=dev
+
+      - name: Zip package
+        run: |
+          zip -r pei-lambda-alert-evaluator.zip src package.json package-lock.json node_modules
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/${{ vars.AWS_OIDC_ROLE_NAME }}
+          role-session-name: gha-lambda-deploy
+
+      - name: Upload zip to S3
+        run: |
+          aws s3 cp pei-lambda-alert-evaluator.zip s3://$BUCKET_NAME/lambda/pei-lambda-alert-evaluator.zip
+
+      - name: Update Lambda configuration (handler/runtime only)
+        run: |
+          ARGS=( --function-name "$LAMBDA_NAME" )
+          [ -n "$LAMBDA_HANDLER" ] && ARGS+=( --handler "$LAMBDA_HANDLER" )
+          [ -n "$LAMBDA_RUNTIME" ] && ARGS+=( --runtime "$LAMBDA_RUNTIME" )
+          if [ ${#ARGS[@]} -gt 2 ]; then
+            aws lambda update-function-configuration "${ARGS[@]}"
+            aws lambda wait function-updated --function-name "$LAMBDA_NAME"
+          fi
+
+      - name: Update Lambda environment variables
+        run: |
+          CURRENT_ENV=$(aws lambda get-function-configuration \
+            --function-name "$LAMBDA_NAME" \
+            --query "Environment.Variables" \
+            --output json)
+
+          UPDATED_ENV=$(echo "$CURRENT_ENV" | jq \
+            --arg SUBS_TABLE "$SUBS_TABLE" \
+            --arg STATE_TABLE "$STATE_TABLE" \
+            --arg SES_FROM "$SES_FROM" \
+            '. + {SUBS_TABLE: $SUBS_TABLE, STATE_TABLE: $STATE_TABLE, SES_FROM: $SES_FROM}')
+
+          echo "{\"FunctionName\": \"$LAMBDA_NAME\", \"Environment\": {\"Variables\": $UPDATED_ENV}}" > lambda-env.json
+          aws lambda update-function-configuration --cli-input-json file://lambda-env.json
+
+      - name: Update Lambda code (+ publish new version)
+        id: update
+        run: |
+          aws lambda get-function --function-name "$LAMBDA_NAME" >/dev/null
+          OUT=$(aws lambda update-function-code \
+            --function-name "$LAMBDA_NAME" \
+            --s3-bucket "$BUCKET_NAME" \
+            --s3-key lambda/pei-lambda-alert-evaluator.zip \
+            --publish \
+            --output json)
+          echo "$OUT" | jq -r '.Version' | awk '{print "version="$1}' >> $GITHUB_OUTPUT

@@ -1,23 +1,16 @@
 {
-  "name": "pei-lambda-alert-evaluator",
-  "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
-  "directories": {
-    "test": "test"
-  },
-  "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
-  },
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/vesakk/pei-lambda-alert-evaluator.git"
-  },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
-  "bugs": {
-    "url": "https://github.com/vesakk/pei-lambda-alert-evaluator/issues"
-  },
-  "homepage": "https://github.com/vesakk/pei-lambda-alert-evaluator#readme"
+	"type": "module",
+	"scripts": {
+		"test": "vitest run"
+	},
+	"devDependencies": {
+		"aws-sdk-client-mock": "^4.1.0",
+		"vitest": "^3.2.4"
+	},
+	"dependencies": {
+		"@aws-sdk/client-dynamodb": "^3.879.0",
+		"@aws-sdk/lib-dynamodb": "^3.876.0",
+		"@aws-sdk/client-sns": "^3.879.0",
+		"@aws-sdk/client-sesv2": "^3.879.0"
+	}
 }
