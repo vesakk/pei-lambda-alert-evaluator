@@ -1,22 +1,28 @@
 name: Deploy pei-lambda-alert-evaluator to Lambda
+
 on:
   push:
     branches: [ "main" ]
+
 permissions:
   id-token: write
   contents: read
+
 concurrency:
   group: lambda-deploy-main
   cancel-in-progress: true
+
 env:
   AWS_REGION: ${{ vars.AWS_REGION }}
-  LAMBDA_NAME: ${{ vars.ALERTS_LAMBDA_NAME }}                     # esim. pei-lambda-alert-evaluator
-  LAMBDA_HANDLER: ${{ vars.LAMBDA_HANDLER }}               # esim. src/lambda_alert_evaluator.handler
-  LAMBDA_RUNTIME: ${{ vars.LAMBDA_RUNTIME }}               # esim. nodejs20.x
-  SUBS_TABLE: ${{ vars.SUBS_TABLE }}                       # esim. alert_subscriptions
-  STATE_TABLE: ${{ vars.STATE_TABLE }}                     # esim. alert_state
-  SES_FROM: ${{ vars.SES_FROM }}                           # esim. noreply@yourdomain.tld (SES verified)
-  BUCKET_NAME: ${{ vars.BUCKET_NAME }}
+  AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
+  LAMBDA_NAME: ${{ vars.ALERTS_LAMBDA_NAME }}        # esim. pei-lambda-alert-evaluator
+  LAMBDA_HANDLER: ${{ vars.LAMBDA_HANDLER }}         # esim. src/lambda_alert_evaluator.handler
+  LAMBDA_RUNTIME: ${{ vars.LAMBDA_RUNTIME }}         # esim. nodejs20.x
+  SUBS_TABLE: ${{ vars.SUBS_TABLE }}                 # esim. alert_subscriptions
+  STATE_TABLE: ${{ vars.STATE_TABLE }}               # esim. alert_state
+  SES_FROM: ${{ vars.SES_FROM }}                     # esim. noreply@yourdomain.tld (SES verified)
+  BUCKET_NAME_PREFIX: ${{ vars.BUCKET_NAME_PREFIX }} # esim. pei-artifacts
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -57,6 +63,13 @@ jobs:
       - name: Prune dev dependencies
         run: npm prune --omit=dev
 
+      - name: Validate required inputs
+        run: |
+          : "${LAMBDA_NAME:?LAMBDA_NAME is empty}"
+          : "${BUCKET_NAME_PREFIX:?BUCKET_NAME_PREFIX is empty}"
+          : "${AWS_ACCOUNT_ID:?AWS_ACCOUNT_ID is empty}"
+          : "${AWS_REGION:?AWS_REGION is empty}"
+
       - name: Zip package
         run: |
           zip -r pei-lambda-alert-evaluator.zip index.mjs src package.json package-lock.json node_modules
@@ -65,38 +78,61 @@ jobs:
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-region: ${{ env.AWS_REGION }}
-          role-to-assume: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/${{ vars.AWS_OIDC_ROLE_NAME }}
+          role-to-assume: arn:aws:iam::${{ env.AWS_ACCOUNT_ID }}:role/${{ vars.AWS_OIDC_ROLE_NAME }}
           role-session-name: gha-lambda-deploy
+
+      - name: Resolve target S3 bucket (BUCKET_NAME_PREFIX-AWS_ACCOUNT_ID-AWS_REGION)
+        id: resolve-bucket
+        shell: bash
+        run: |
+          set -euo pipefail
+          PREFIX="${BUCKET_NAME_PREFIX%-}"
+          PREFIX_LOWER="$(printf '%s' "$PREFIX" | tr '[:upper:]' '[:lower:]')"
+          BUCKET="${PREFIX_LOWER}-${AWS_ACCOUNT_ID}-${AWS_REGION}"
+          echo "Resolved bucket: ${BUCKET}"
+          echo "S3_BUCKET=$BUCKET" >> "$GITHUB_ENV"
+
+          if ! aws s3api head-bucket --bucket "$BUCKET" 2>/dev/null; then
+            echo "ERROR: Bucket '$BUCKET' ei ole olemassa tai siihen ei ole oikeuksia." >&2
+            echo "Varmista, että CFN loi bucketing ja OIDC-roolilla on oikeudet (s3:ListBucket, s3:PutObject, s3:DeleteObject) polkuun lambda/*." >&2
+            exit 1
+          fi
 
       - name: Upload zip to S3
         run: |
-          aws s3 cp pei-lambda-alert-evaluator.zip s3://$BUCKET_NAME/lambda/pei-lambda-alert-evaluator.zip
+          aws s3 cp pei-lambda-alert-evaluator.zip "s3://$S3_BUCKET/lambda/pei-lambda-alert-evaluator.zip"
 
       - name: Update Lambda configuration (handler/runtime only)
         run: |
           ARGS=( --function-name "$LAMBDA_NAME" )
-          [ -n "$LAMBDA_HANDLER" ] && ARGS+=( --handler "$LAMBDA_HANDLER" )
-          [ -n "$LAMBDA_RUNTIME" ] && ARGS+=( --runtime "$LAMBDA_RUNTIME" )
+          [ -n "${LAMBDA_HANDLER:-}" ] && ARGS+=( --handler "$LAMBDA_HANDLER" )
+          [ -n "${LAMBDA_RUNTIME:-}" ] && ARGS+=( --runtime "$LAMBDA_RUNTIME" )
           if [ ${#ARGS[@]} -gt 2 ]; then
             aws lambda update-function-configuration "${ARGS[@]}"
             aws lambda wait function-updated --function-name "$LAMBDA_NAME"
           fi
 
-      - name: Update Lambda environment variables
+      - name: Update Lambda environment variables (merge with existing)
+        shell: bash
         run: |
-          CURRENT_ENV=$(aws lambda get-function-configuration \
+          set -euo pipefail
+          CURRENT_ENV_JSON=$(aws lambda get-function-configuration \
             --function-name "$LAMBDA_NAME" \
             --query "Environment.Variables" \
-            --output json)
+            --output json || echo "null")
 
-          UPDATED_ENV=$(echo "$CURRENT_ENV" | jq \
-            --arg SUBS_TABLE "$SUBS_TABLE" \
-            --arg STATE_TABLE "$STATE_TABLE" \
-            --arg SES_FROM "$SES_FROM" \
-            '. + {SUBS_TABLE: $SUBS_TABLE, STATE_TABLE: $STATE_TABLE, SES_FROM: $SES_FROM}')
+          UPDATED_ENV_JSON=$(jq -c \
+            --arg subs "${SUBS_TABLE:-}" \
+            --arg state "${STATE_TABLE:-}" \
+            --arg ses   "${SES_FROM:-}" \
+            '(. // {}) + {"SUBS_TABLE": $subs, "STATE_TABLE": $state, "SES_FROM": $ses}' \
+            <<< "$CURRENT_ENV_JSON")
 
-          echo "{\"FunctionName\": \"$LAMBDA_NAME\", \"Environment\": {\"Variables\": $UPDATED_ENV}}" > lambda-env.json
+          printf '{"FunctionName":"%s","Environment":{"Variables":%s}}\n' \
+            "$LAMBDA_NAME" "$UPDATED_ENV_JSON" > lambda-env.json
+
           aws lambda update-function-configuration --cli-input-json file://lambda-env.json
+          aws lambda wait function-updated --function-name "$LAMBDA_NAME"
 
       - name: Update Lambda code (+ publish new version)
         id: update
@@ -104,7 +140,7 @@ jobs:
           aws lambda get-function --function-name "$LAMBDA_NAME" >/dev/null
           OUT=$(aws lambda update-function-code \
             --function-name "$LAMBDA_NAME" \
-            --s3-bucket "$BUCKET_NAME" \
+            --s3-bucket "$S3_BUCKET" \
             --s3-key lambda/pei-lambda-alert-evaluator.zip \
             --publish \
             --output json)
