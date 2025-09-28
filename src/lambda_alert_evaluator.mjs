@@ -1,6 +1,13 @@
-// Node.js 20+ (ESM)
-// Event source: DynamoDB Streams (sensor_data) -> tämä Lambda arvioi hälytysrajat
-// Env: SUBS_TABLE=alert_subscriptions, STATE_TABLE=alert_state, SES_FROM=noreply@domain.tld
+// src/lambda_alert_evaluator.mjs
+// Node.js 20+, ES Modules
+//
+// DynamoDB Streams (sensor_data) -> arvioi hälytysrajat (per käyttäjätilaus ja metriikka).
+// - Tilaukset alert_subscriptions (PK=sensorId, SK=userSub).
+// - Tila alert_state (PK=`${sensorId}#${metric}`, SK=userSub).
+// - Kanavat: email (SESv2), sms (SNS Publish PhoneNumber).
+//
+// Env: SUBS_TABLE, STATE_TABLE, SES_FROM
+
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import {
   DynamoDBDocumentClient,
@@ -13,138 +20,203 @@ import { SESv2Client, SendEmailCommand } from "@aws-sdk/client-sesv2";
 
 const SUBS_TABLE = process.env.SUBS_TABLE || "alert_subscriptions";
 const STATE_TABLE = process.env.STATE_TABLE || "alert_state";
-const SES_FROM = process.env.SES_FROM || ""; // pitää olla SES-identity (domain/osoite)
+const SES_FROM = process.env.SES_FROM || "";
 
 const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}), {
   marshallOptions: { removeUndefinedValues: true },
 });
-
 const sns = new SNSClient({});
 const ses = new SESv2Client({});
+
+// ---- Utils ----
+const nowIso = () => new Date().toISOString();
+const isoToMs = (iso) => (iso ? Date.parse(iso) : 0);
+
+/** Palauta { sensorId, ts, measurements: {metric:number,...} } DynamoDB Streams NewImage:stä */
+function parseNewImage(newImage) {
+  if (!newImage) return null;
+  const sensorId = newImage.sensorId?.S;
+  const ts = newImage.ts?.N ? Number(newImage.ts.N) : undefined;
+  if (!sensorId || !ts) return null;
+  const measurements = {};
+  for (const [k, v] of Object.entries(newImage)) {
+    if (k === "sensorId" || k === "ts") continue;
+    if (v && typeof v === "object" && "N" in v) {
+      const num = Number(v.N);
+      if (!Number.isNaN(num)) measurements[k] = num;
+    }
+  }
+  return { sensorId, ts, measurements };
+}
+
+async function fetchSubscriptions(sensorId) {
+  const res = await ddb.send(
+    new QueryCommand({
+      TableName: SUBS_TABLE,
+      KeyConditionExpression: "sensorId = :sid",
+      ExpressionAttributeValues: { ":sid": sensorId },
+    })
+  );
+  return Array.isArray(res.Items) ? res.Items : [];
+}
+
+async function getPrevState(pk, sk) {
+  const out = await ddb.send(
+    new GetCommand({
+      TableName: STATE_TABLE,
+      Key: { pk, sk },
+    })
+  );
+  return out?.Item;
+}
+
+async function putState(pk, sk, state, lastNotifiedAt = null) {
+  await ddb.send(
+    new PutCommand({
+      TableName: STATE_TABLE,
+      Item: {
+        pk,
+        sk,
+        lastState: state,
+        lastNotifiedAt,
+      },
+    })
+  );
+}
+
+function withinCooldown(lastNotifiedAtIso, cooldownSec) {
+  if (!cooldownSec || cooldownSec <= 0) return false;
+  const last = isoToMs(lastNotifiedAtIso);
+  if (!last) return false;
+  return Date.now() - last < cooldownSec * 1000;
+}
+
+function evalState({ value, thresholds, prevState }) {
+  if (!thresholds) return null; // ei thresholdia -> ei tutkita
+  const min = thresholds.min;
+  const max = thresholds.max;
+  const hys = thresholds.hysteresis ?? 0;
+
+  // raaka-tila ilman hystereesiä
+  let raw;
+  if (typeof max === "number" && value > max) raw = "high";
+  else if (typeof min === "number" && value < min) raw = "low";
+  else raw = "ok";
+
+  if (!prevState || prevState === raw) return raw;
+
+  // hystereesi: pysy high kunnes pudotaan max - hys; pysy low kunnes noustaan min + hys
+  if (prevState === "high") {
+    if (typeof max === "number" && value > (max - hys)) return "high";
+    return "ok";
+  }
+  if (prevState === "low") {
+    if (typeof min === "number" && value < (min + hys)) return "low";
+    return "ok";
+  }
+  return raw;
+}
+
+function buildMessage({ sensorId, metric, val, state, ts }) {
+  const when = new Date(ts).toISOString();
+  const subject = `[PEI] ${sensorId} ${metric} ${state.toUpperCase()}: ${val}`;
+  const body = `Sensor: ${sensorId}
+Metric: ${metric}
+Value: ${val}
+State: ${state}
+At: ${when}`;
+  return { subject, body };
+}
+
+async function notifyChannels({ channels, email, phone, subject, body }) {
+  if (channels?.includes("email") && email && SES_FROM) {
+    await ses.send(
+      new SendEmailCommand({
+        FromEmailAddress: SES_FROM,
+        Destination: { ToAddresses: [email] },
+        Content: {
+          Simple: { Subject: { Data: subject }, Body: { Text: { Data: body } } },
+        },
+      })
+    );
+  }
+  if (channels?.includes("sms") && phone) {
+    await sns.send(
+      new PublishCommand({
+        PhoneNumber: phone,
+        Message: body,
+      })
+    );
+  }
+}
+
+async function processRecord(rec) {
+  // Vain INSERT — skippaa REMOVE/MODIFY
+  if (rec?.eventName !== "INSERT") return;
+
+  const parsed = parseNewImage(rec?.dynamodb?.NewImage);
+  if (!parsed) return;
+
+  const { sensorId, ts, measurements } = parsed;
+  const metricKeys = Object.keys(measurements);
+  if (metricKeys.length === 0) return; // tyhjät mittaukset -> ei mitään
+
+  // Hae tilaukset vasta nyt (on jotain mitattavaa)
+  const subs = await fetchSubscriptions(sensorId);
+  if (!subs.length) return;
+
+  for (const metric of metricKeys) {
+    const val = measurements[metric];
+    for (const sub of subs) {
+      if (!sub?.active) continue;
+      const thresholds = sub?.thresholds?.[metric];
+      if (!thresholds) continue; // ei thresholdia tälle metrille
+
+      const pk = `${sensorId}#${metric}`;
+      const sk = sub.userSub;
+
+      const prev = await getPrevState(pk, sk);
+      const prevState = prev?.lastState;
+
+      const curState = evalState({ value: val, thresholds, prevState });
+      if (!curState) continue; // varmistus
+
+      const changed = (!prevState || prevState !== curState);
+
+      // Ilmoitus vain hälytystiloista
+      const isAlarm = curState === "low" || curState === "high";
+      const shouldNotify =
+        isAlarm && (changed || !withinCooldown(prev?.lastNotifiedAt, sub?.cooldownSec));
+
+      if (shouldNotify) {
+        const { subject, body } = buildMessage({
+          sensorId, metric, val, state: curState, ts
+        });
+        await notifyChannels({
+          channels: sub.channels,
+          email: sub.email,
+          phone: sub.phone_number,
+          subject,
+          body,
+        });
+        await putState(pk, sk, curState, nowIso());
+      } else if (changed) {
+        // Tila muuttui, mutta ei hälytystilaan -> päivitä tila ilman ilmoitusta
+        await putState(pk, sk, curState, prev?.lastNotifiedAt || null);
+      }
+    }
+  }
+}
 
 export const handler = async (event) => {
   try {
     const records = Array.isArray(event?.Records) ? event.Records : [];
     for (const rec of records) {
-      if (rec.eventName === "REMOVE") continue;
-
-      const img = rec.dynamodb?.NewImage;
-      if (!img) continue;
-
-      const sensorId = img.sensorId?.S || img.sensorId?.s || null;
-      if (!sensorId) continue;
-
-      const ts = img.ts?.N ? Number(img.ts.N) : Date.now();
-
-      // Poimi kaikki numeeriset mittauskentät (pl. ts)
-      const measurements = {};
-      for (const [k, v] of Object.entries(img)) {
-        if (k === "ts") continue;
-        if (v?.N) {
-          const num = Number(v.N);
-          if (Number.isFinite(num)) measurements[k] = num;
-        }
-      }
-      if (!Object.keys(measurements).length) continue;
-
-      // Hae tilaajat sensorille
-      const subsResp = await ddb.send(
-        new QueryCommand({
-          TableName: SUBS_TABLE,
-          KeyConditionExpression: "sensorId = :s",
-          ExpressionAttributeValues: { ":s": sensorId },
-        })
-      );
-
-      const subs = subsResp.Items || [];
-      for (const s of subs) {
-        if (s?.active === false) continue;
-
-        const channels = Array.isArray(s?.channels) ? s.channels : [];
-        const thresholds = s?.thresholds || {};
-        const userSub = s?.userSub;
-        const cooldown = Number.isFinite(s?.cooldownSec) ? s.cooldownSec : 1800;
-
-        for (const [metric, value] of Object.entries(measurements)) {
-          const thr = thresholds[metric];
-          if (!thr) continue;
-
-          const state = classify(value, thr); // "ok" | "low" | "high"
-          const key = { pk: `${sensorId}#${metric}`, sk: userSub };
-          const prev = await ddb.send(
-            new GetCommand({ TableName: STATE_TABLE, Key: key })
-          );
-
-          const now = Date.now();
-          const last =
-            prev.Item?.lastNotifiedAt ? Date.parse(prev.Item.lastNotifiedAt) : 0;
-          const changed = state !== (prev.Item?.lastState ?? "ok");
-          const cooled = (now - last) / 1000 >= cooldown;
-
-          if (state !== "ok" && (changed || cooled)) {
-            const subject = `Alert ${sensorId} ${metric} ${state.toUpperCase()}`;
-            const msg = `[${sensorId}] ${metric} ${state.toUpperCase()} value=${value} ts=${ts}`;
-
-            // Suosittelen tallettamaan s.email / s.phone_number tilaajaan.
-            if (channels.includes("sms") && s?.phone_number) {
-              await sns.send(
-                new PublishCommand({ PhoneNumber: s.phone_number, Message: msg })
-              );
-            }
-            if (channels.includes("email") && s?.email && SES_FROM) {
-              await ses.send(
-                new SendEmailCommand({
-                  FromEmailAddress: SES_FROM,
-                  Destination: { ToAddresses: [s.email] },
-                  Content: {
-                    Simple: {
-                      Subject: { Data: subject },
-                      Body: { Text: { Data: msg } },
-                    },
-                  },
-                })
-              );
-            }
-
-            await ddb.send(
-              new PutCommand({
-                TableName: STATE_TABLE,
-                Item: {
-                  ...key,
-                  lastNotifiedAt: new Date(now).toISOString(),
-                  lastState: state,
-                },
-              })
-            );
-          } else if (state === "ok" && changed) {
-            // Paluu normaaliin tilaan
-            await ddb.send(
-              new PutCommand({
-                TableName: STATE_TABLE,
-                Item: {
-                  ...key,
-                  lastNotifiedAt: new Date().toISOString(),
-                  lastState: "ok",
-                },
-              })
-            );
-          }
-        }
-      }
+      await processRecord(rec);
     }
-
-    return { ok: true, processed: (event?.Records || []).length };
+    return { ok: true, processed: records.length };
   } catch (err) {
     console.error("Alert evaluator error:", err);
     return { ok: false, error: String(err?.message || err) };
   }
 };
-
-// ---------- Apurit ----------
-function classify(value, thr) {
-  if (typeof value !== "number" || !Number.isFinite(value)) return "ok";
-  const h = Number.isFinite(thr?.hysteresis) ? Number(thr.hysteresis) : 0;
-  if (thr?.min !== undefined && value < Number(thr.min) - h) return "low";
-  if (thr?.max !== undefined && value > Number(thr.max) + h) return "high";
-  return "ok";
-}
