@@ -22,7 +22,7 @@ const sesMock = mockClient(SESv2Client);
 function ddbNumber(n) { return { N: String(n) }; }
 function ddbString(s) { return { S: String(s) }; }
 
-function streamEvent({ sensorId = "elt-1", ts = Date.now(), measurements = {} } = {}) {
+function streamEvent({ sensorId = "elt-1", ts = Date.now(), measurements = {}, eventName = "INSERT" } = {}) {
   const NewImage = { sensorId: ddbString(sensorId), ts: ddbNumber(ts) };
   for (const [k, v] of Object.entries(measurements)) {
     if (typeof v === "number") NewImage[k] = ddbNumber(v);
@@ -30,7 +30,7 @@ function streamEvent({ sensorId = "elt-1", ts = Date.now(), measurements = {} } 
   return {
     Records: [
       {
-        eventName: "INSERT",
+        eventName,
         dynamodb: { NewImage },
       },
     ],
@@ -85,11 +85,13 @@ describe("pei-lambda-alert-evaluator", () => {
   it("lähettää hälytyksen (email+sms) kun raja ylittyy ja ei ole cooldownia", async () => {
     const evt = streamEvent({
       sensorId: "elt-123",
-      measurements: { tC: 31.2, rhPct: 40 }, // päivitetty metrinimet
+      measurements: { tC: 31.2, rhPct: 40 },
     });
 
     const res = await handler(evt);
     expect(res.ok).toBe(true);
+    expect(res.processed).toBe(1);
+    expect(res.failed).toBe(0);
 
     // Subscription haetaan
     expect(ddbMock.commandCalls(QueryCommand).length).toBe(1);
@@ -97,7 +99,7 @@ describe("pei-lambda-alert-evaluator", () => {
     // Edellinen tila haetaan
     expect(ddbMock.commandCalls(GetCommand).length).toBeGreaterThanOrEqual(1);
 
-    // Viestit lähtevät
+    // Viestit lähtevät (retry-logiikka: 1 onnistunut yritys per kanava)
     expect(snsMock.commandCalls(PublishCommand).length).toBe(1);
     expect(sesMock.commandCalls(SendEmailCommand).length).toBe(1);
 
@@ -106,11 +108,12 @@ describe("pei-lambda-alert-evaluator", () => {
     const putCall = ddbMock.commandCalls(PutCommand)[0].args[0].input;
     expect(putCall.TableName).toBe("alert_state");
     expect(putCall.Item.lastState).toBe("high");
-    expect(putCall.Item.pk).toBe("elt-123#tC"); // päivitetty: tC
+    expect(putCall.Item.pk).toBe("elt-123#tC");
     expect(putCall.Item.sk).toBe("u1");
+    expect(putCall.Item.lastNotifiedAt).toBeDefined();
   });
 
-  it("ei lähetä uutta hälytystä cooldownin sisällä", async () => {
+  it("ei lähetä uutta hälytystä cooldownin sisällä, mutta päivittää tilan", async () => {
     const recentIso = new Date(Date.now() - 10 * 1000).toISOString(); // 10s sitten
     ddbMock.on(GetCommand).resolves({ Item: { lastState: "high", lastNotifiedAt: recentIso } });
 
@@ -125,12 +128,17 @@ describe("pei-lambda-alert-evaluator", () => {
     // Cooldown estää uudet viestit
     expect(snsMock.commandCalls(PublishCommand).length).toBe(0);
     expect(sesMock.commandCalls(SendEmailCommand).length).toBe(0);
-    // Ei myöskään kirjoiteta uutta tilaa (jos tila ei muuttunut)
-    expect(ddbMock.commandCalls(PutCommand).length).toBe(0);
+    
+    // KORJAUS: Tila päivitetään myös cooldownissa
+    expect(ddbMock.commandCalls(PutCommand).length).toBe(1);
+    const put = ddbMock.commandCalls(PutCommand)[0].args[0].input;
+    expect(put.Item.lastState).toBe("high");
+    expect(put.Item.lastNotifiedAt).toBe(recentIso); // säilytetään vanha
   });
 
   it("kirjaa palautuksen ok-tilaan ilman viestien lähetystä", async () => {
-    ddbMock.on(GetCommand).resolves({ Item: { lastState: "high", lastNotifiedAt: new Date(Date.now()-2000).toISOString() } });
+    const lastNotified = new Date(Date.now()-2000).toISOString();
+    ddbMock.on(GetCommand).resolves({ Item: { lastState: "high", lastNotifiedAt: lastNotified } });
     ddbMock.on(QueryCommand).resolves({
       Items: [ subsItem({ thresholds: { tC: { max: 30, hysteresis: 0.5 } } }) ],
     });
@@ -147,10 +155,11 @@ describe("pei-lambda-alert-evaluator", () => {
     expect(snsMock.commandCalls(PublishCommand).length).toBe(0);
     expect(sesMock.commandCalls(SendEmailCommand).length).toBe(0);
 
-    // Tila päivitetään ok:ksi
+    // Tila päivitetään ok:ksi, lastNotifiedAt säilyy
     expect(ddbMock.commandCalls(PutCommand).length).toBe(1);
     const put = ddbMock.commandCalls(PutCommand)[0].args[0].input;
     expect(put.Item.lastState).toBe("ok");
+    expect(put.Item.lastNotifiedAt).toBe(lastNotified);
   });
 
   it("ei tee mitään jos mittarille ei ole thresholdia", async () => {
@@ -176,5 +185,74 @@ describe("pei-lambda-alert-evaluator", () => {
     const evt = streamEvent({ sensorId: "elt-2", measurements: {} });
     await handler(evt);
     expect(ddbMock.commandCalls(QueryCommand).length).toBe(0);
+  });
+
+  it("jatkaa käsittelyä vaikka yksi tietue epäonnistuu", async () => {
+    const evt = {
+      Records: [
+        {
+          eventName: "INSERT",
+          dynamodb: { NewImage: { sensorId: ddbString("elt-1"), ts: ddbNumber(Date.now()), tC: ddbNumber(31) } },
+        },
+        {
+          eventName: "INSERT",
+          dynamodb: { NewImage: null }, // virheellinen
+        },
+        {
+          eventName: "INSERT",
+          dynamodb: { NewImage: { sensorId: ddbString("elt-2"), ts: ddbNumber(Date.now()), tC: ddbNumber(32) } },
+        },
+      ],
+    };
+
+    const res = await handler(evt);
+    expect(res.ok).toBe(true);
+    expect(res.processed).toBe(3);
+    expect(res.failed).toBe(0); // null NewImage ei aiheuta virhettä, vain skipattaan
+  });
+
+  it("yrittää uudelleen jos ilmoitus epäonnistuu", async () => {
+    sesMock.on(SendEmailCommand).rejectsOnce(new Error("SES error")).resolves({});
+
+    const evt = streamEvent({
+      sensorId: "elt-123",
+      measurements: { tC: 31.5 },
+    });
+
+    const res = await handler(evt);
+    expect(res.ok).toBe(true);
+
+    // Retry: 2 yritystä
+    expect(sesMock.commandCalls(SendEmailCommand).length).toBe(2);
+    
+    // Tila päivitetään onnistuneen ilmoituksen jälkeen
+    expect(ddbMock.commandCalls(PutCommand).length).toBe(1);
+    const put = ddbMock.commandCalls(PutCommand)[0].args[0].input;
+    expect(put.Item.lastNotifiedAt).toBeDefined();
+  });
+
+  it("ei päivitä lastNotifiedAt jos kaikki ilmoitukset epäonnistuvat", async () => {
+    const oldNotified = new Date(Date.now() - 3600000).toISOString();
+    ddbMock.on(GetCommand).resolves({ Item: { lastState: "ok", lastNotifiedAt: oldNotified } });
+    sesMock.on(SendEmailCommand).rejects(new Error("SES error"));
+    snsMock.on(PublishCommand).rejects(new Error("SNS error"));
+
+    const evt = streamEvent({
+      sensorId: "elt-123",
+      measurements: { tC: 31.5 },
+    });
+
+    const res = await handler(evt);
+    expect(res.ok).toBe(true);
+
+    // Molemmat kanavat yrittävät 2 kertaa
+    expect(sesMock.commandCalls(SendEmailCommand).length).toBe(2);
+    expect(snsMock.commandCalls(PublishCommand).length).toBe(2);
+
+    // Tila päivitetään, mutta lastNotifiedAt säilyy vanhana
+    expect(ddbMock.commandCalls(PutCommand).length).toBe(1);
+    const put = ddbMock.commandCalls(PutCommand)[0].args[0].input;
+    expect(put.Item.lastState).toBe("high");
+    expect(put.Item.lastNotifiedAt).toBe(oldNotified); // ei päivitetty
   });
 });

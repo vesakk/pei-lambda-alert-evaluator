@@ -129,29 +129,50 @@ At: ${when}`;
 }
 
 async function notifyChannels({ channels, email, phone, subject, body }) {
+  const errors = [];
+  
   if (channels?.includes("email") && email && SES_FROM) {
-    await ses.send(
-      new SendEmailCommand({
-        FromEmailAddress: SES_FROM,
-        Destination: { ToAddresses: [email] },
-        Content: {
-          Simple: { Subject: { Data: subject }, Body: { Text: { Data: body } } },
-        },
-      })
-    );
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        await ses.send(
+          new SendEmailCommand({
+            FromEmailAddress: SES_FROM,
+            Destination: { ToAddresses: [email] },
+            Content: {
+              Simple: { Subject: { Data: subject }, Body: { Text: { Data: body } } },
+            },
+          })
+        );
+        console.log(`Email sent to ${email}`);
+        break;
+      } catch (err) {
+        if (attempt === 2) errors.push(`Email failed: ${err.message}`);
+      }
+    }
   }
+  
   if (channels?.includes("sms") && phone) {
-    await sns.send(
-      new PublishCommand({
-        PhoneNumber: phone,
-        Message: body,
-      })
-    );
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        await sns.send(
+          new PublishCommand({
+            PhoneNumber: phone,
+            Message: body,
+          })
+        );
+        console.log(`SMS sent to ${phone}`);
+        break;
+      } catch (err) {
+        if (attempt === 2) errors.push(`SMS failed: ${err.message}`);
+      }
+    }
   }
+  
+  if (errors.length) throw new Error(errors.join("; "));
 }
 
 async function processRecord(rec) {
-  // Vain INSERT — skippaa REMOVE/MODIFY
+  // Vain INSERT
   if (rec?.eventName !== "INSERT") return;
 
   const parsed = parseNewImage(rec?.dynamodb?.NewImage);
@@ -182,26 +203,31 @@ async function processRecord(rec) {
       if (!curState) continue; // varmistus
 
       const changed = (!prevState || prevState !== curState);
-
-      // Ilmoitus vain hälytystiloista
       const isAlarm = curState === "low" || curState === "high";
-      const shouldNotify =
-        isAlarm && (changed || !withinCooldown(prev?.lastNotifiedAt, sub?.cooldownSec));
+      const cooldownActive = withinCooldown(prev?.lastNotifiedAt, sub?.cooldownSec);
+      const shouldNotify = isAlarm && (changed || !cooldownActive);
 
       if (shouldNotify) {
         const { subject, body } = buildMessage({
           sensorId, metric, val, state: curState, ts
         });
-        await notifyChannels({
-          channels: sub.channels,
-          email: sub.email,
-          phone: sub.phone_number,
-          subject,
-          body,
-        });
-        await putState(pk, sk, curState, nowIso());
-      } else if (changed) {
-        // Tila muuttui, mutta ei hälytystilaan -> päivitä tila ilman ilmoitusta
+        try {
+          await notifyChannels({
+            channels: sub.channels,
+            email: sub.email,
+            phone: sub.phone_number,
+            subject,
+            body,
+          });
+          await putState(pk, sk, curState, nowIso());
+          console.log(`Alert sent: ${sensorId}#${metric} ${curState} to ${sub.userSub}`);
+        } catch (err) {
+          console.error(`Notification failed for ${sub.userSub}:`, err.message);
+          // Päivitä tila ilman lastNotifiedAt, jotta seuraavalla kerralla yritetään uudelleen
+          await putState(pk, sk, curState, prev?.lastNotifiedAt || null);
+        }
+      } else if (changed || (isAlarm && cooldownActive)) {
+        // Päivitä tila: muutos tai hälytys cooldownissa
         await putState(pk, sk, curState, prev?.lastNotifiedAt || null);
       }
     }
@@ -209,14 +235,21 @@ async function processRecord(rec) {
 }
 
 export const handler = async (event) => {
-  try {
-    const records = Array.isArray(event?.Records) ? event.Records : [];
-    for (const rec of records) {
-      await processRecord(rec);
-    }
-    return { ok: true, processed: records.length };
-  } catch (err) {
-    console.error("Alert evaluator error:", err);
-    return { ok: false, error: String(err?.message || err) };
+  const records = Array.isArray(event?.Records) ? event.Records : [];
+  const results = await Promise.allSettled(
+    records.map(rec => processRecord(rec))
+  );
+  
+  const failed = results.filter(r => r.status === "rejected");
+  if (failed.length) {
+    failed.forEach((f, i) => 
+      console.error(`Record ${i} failed:`, f.reason)
+    );
   }
+  
+  return { 
+    ok: true, 
+    processed: records.length, 
+    failed: failed.length 
+  };
 };

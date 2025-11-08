@@ -2,68 +2,58 @@
 
 ## Project Overview
 
-This project contains a serverless AWS Lambda function written in Node.js (ESM). The function, `pei-lambda-alert-evaluator`, is designed to be triggered by events from a DynamoDB stream connected to a `sensor_data` table.
+This project is an AWS Lambda function named `pei-lambda-alert-evaluator`. It is written in Node.js (v20+) using ES Modules.
 
-Its primary purpose is to evaluate incoming sensor measurements against user-defined alert thresholds. These thresholds and user contact information are stored in a separate DynamoDB table (`alert_subscriptions`).
+Its primary purpose is to process real-time sensor data from a DynamoDB Stream. When new data for a sensor is inserted, this function evaluates the data against user-defined alert subscriptions.
 
-When a measurement crosses a defined threshold (taking hysteresis into account), the function triggers alerts via:
-- **SMS** using Amazon SNS
-- **Email** using Amazon SES
+**Core Logic:**
 
-The function maintains the alert state for each sensor and user in an `alert_state` DynamoDB table. This allows it to manage alert cooldown periods, preventing notification spam, and to track when a sensor's state returns to normal.
-
-**Key Technologies:**
-- Node.js 20+ (ESM)
-- AWS Lambda
-- Amazon DynamoDB (for data, subscriptions, and state)
-- Amazon SNS (for SMS alerts)
-- Amazon SES (for email alerts)
-- Vitest (for testing)
-- AWS SDK for JavaScript v3
+1.  **Trigger:** The Lambda is triggered by `INSERT` events in a DynamoDB table stream (presumably containing sensor data).
+2.  **Subscriptions:** It fetches alert subscriptions from an `alert_subscriptions` DynamoDB table. Each subscription defines thresholds for specific metrics for a sensor.
+3.  **State Evaluation:** The function checks the incoming sensor metric values against the subscribed thresholds. It maintains the alert state (`high`, `low`, `ok`) in an `alert_state` DynamoDB table. Hysteresis is applied to prevent rapid state changes (flapping).
+4.  **Notifications:** If a metric value crosses a threshold and enters an alarm state (`high` or `low`), the function sends notifications through multiple channels:
+    *   **Email:** Using AWS SES (Simple Email Service).
+    *   **SMS:** Using AWS SNS (Simple Notification Service).
+5.  **Cooldown:** A cooldown mechanism is in place to prevent sending excessive notifications for an ongoing alert.
 
 ## Building and Running
 
-### Building
+### Dependencies
 
-There is no explicit build step required for this project, as it is written in JavaScript.
+Install project dependencies using npm:
 
-### Running Locally
-
-The function is intended to be deployed and run on AWS Lambda. To run it locally, you would need to simulate a Lambda environment and provide it with a DynamoDB Stream event payload.
-
-The tests provide a good example of how to invoke the handler function with simulated events.
+```bash
+npm install
+```
 
 ### Testing
 
-To run the unit tests, use the following command:
+The project uses `vitest` for testing. Tests are located in the `test/` directory and use `aws-sdk-client-mock` to mock AWS services.
+
+Run the tests with:
 
 ```bash
 npm test
 ```
 
-This command executes the test suite defined in `test/lambda_alert_evaluator.test.mjs` using `vitest`.
-
 ## Development Conventions
 
-### Code Style
+*   **Language:** Modern Node.js (v20+) with ES Modules (`"type": "module"`).
+*   **Source Code:** The main application logic is in `src/lambda_alert_evaluator.mjs`. The entry point for the Lambda is `index.mjs`.
+*   **Testing:** Tests are written with `vitest`. Mocks for AWS services are created using `aws-sdk-client-mock`. Test files end with `.test.mjs`.
+*   **Configuration:** The Lambda function is configured via environment variables:
+    *   `SUBS_TABLE`: Name of the DynamoDB table for alert subscriptions.
+    *   `STATE_TABLE`: Name of the DynamoDB table for alert states.
+    *   `SES_FROM`: The verified email address to send alerts from using SES.
 
-- The project uses modern JavaScript with ES Modules (`import`/`export`).
-- The code is structured to be clean and readable, with helper functions separated from the main handler logic.
+## Deployment
 
-### Testing Practices
+Deployment to AWS Lambda is automated via a GitHub Actions workflow defined in `.github/workflows/deploy.yml`.
 
-- Unit tests are located in the `test/` directory.
-- The project uses `vitest` as its testing framework.
-- AWS services are mocked using `aws-sdk-client-mock`, allowing for isolated and predictable testing of the function's logic without making actual AWS API calls.
-- Tests cover various scenarios, including:
-    - Triggering alerts on threshold breaches.
-    - Respecting cooldown periods.
-    - Handling the return to a normal state.
-    - Ignoring irrelevant events or measurements.
+The workflow is triggered on every push to the `main` branch. It performs the following steps:
 
-### Configuration
-
-- The function is configured via environment variables:
-    - `SUBS_TABLE`: Name of the DynamoDB table for alert subscriptions (defaults to `alert_subscriptions`).
-    - `STATE_TABLE`: Name of the DynamoDB table for alert state (defaults to `alert_state`).
-    - `SES_FROM`: The email address to use as the sender for SES email alerts. This must be a verified identity in SES.
+1.  **Run Tests:** Executes `npm test` to ensure code quality.
+2.  **Package:** Creates a `.zip` archive containing the necessary production code and dependencies (`npm prune --omit=dev`).
+3.  **Authenticate:** Securely authenticates with AWS using OIDC.
+4.  **Upload:** Uploads the deployment package to a designated S3 bucket.
+5.  **Deploy:** Updates the Lambda function's code and configuration (including environment variables) with the new version from S3.
